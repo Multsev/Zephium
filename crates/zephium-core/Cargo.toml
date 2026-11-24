@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 ipc-types = []
+experimental-sonoma-14-3 = []
 
 [dependencies]
 ulid.workspace = true

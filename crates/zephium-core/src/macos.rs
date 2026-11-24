@@ -337,8 +337,18 @@ pub fn assess_runtime(
         major => return Err(AdmissionError::UnsupportedOperatingSystemMajor(major)),
     };
 
-    if safari.major() < SAFARI_SECURITY_FLOOR.major() {
+    // Explicitly built experimental variant for the owner's existing machine.
+    // This does not make the old WebKit security-reviewed or patch its flaws.
+    let experimental_legacy = cfg!(feature = "experimental-sonoma-14-3")
+        && operating_system == ProductVersion::new(14, 3, 0)
+        && safari == ProductVersion::new(17, 3, 0);
+    if safari.major() < SAFARI_SECURITY_FLOOR.major() && !experimental_legacy {
         return Err(AdmissionError::UnsupportedSafariMajor(safari.major()));
+    }
+    if experimental_legacy {
+        advisories.insert(RuntimeSecurityAdvisory::update_recommended(
+            RuntimeSecurityUpdateTarget::OperatingSystem,
+        ));
     }
     if safari.major() > SAFARI_REVIEWED_MAJOR {
         advisories.insert(RuntimeSecurityAdvisory::unreviewed_runtime());
@@ -506,6 +516,24 @@ mod tests {
         assert_eq!(
             assess_at_review("15.8.1", "18.6", BUILD, BUILD),
             Err(AdmissionError::UnsupportedSafariMajor(18))
+        );
+    }
+
+    #[test]
+    fn experimental_sonoma_is_explicit_and_narrow() {
+        let result = assess_at_review("14.3.0", "17.3", BUILD, BUILD);
+        if cfg!(feature = "experimental-sonoma-14-3") {
+            let mut warnings = RuntimeSecurityAdvisories::new();
+            warnings.insert(RuntimeSecurityAdvisory::update_recommended(
+                RuntimeSecurityUpdateTarget::OperatingSystem,
+            ));
+            assert_eq!(result, Ok(warnings));
+        } else {
+            assert_eq!(result, Err(AdmissionError::UnsupportedSafariMajor(17)));
+        }
+        assert_eq!(
+            assess_at_review("14.3.0", "17.2", BUILD, BUILD),
+            Err(AdmissionError::UnsupportedSafariMajor(17))
         );
     }
 
