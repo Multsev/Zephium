@@ -38,6 +38,7 @@ pub enum Browser {
     Arc,
     Zen,
     Chrome,
+    Yandex,
     Safari,
     Brave,
     Helium,
@@ -57,10 +58,11 @@ pub enum Browser {
 impl Browser {
     /// In the order they are offered: where this audience most often comes
     /// from first.
-    pub const ALL: [Browser; 17] = [
+    pub const ALL: [Browser; 18] = [
         Browser::Arc,
         Browser::Zen,
         Browser::Chrome,
+        Browser::Yandex,
         Browser::Safari,
         Browser::Brave,
         Browser::Helium,
@@ -82,6 +84,7 @@ impl Browser {
             Browser::Arc => "arc",
             Browser::Zen => "zen",
             Browser::Chrome => "chrome",
+            Browser::Yandex => "yandex",
             Browser::Safari => "safari",
             Browser::Brave => "brave",
             Browser::Helium => "helium",
@@ -108,6 +111,7 @@ impl Browser {
             Browser::Arc => "Arc",
             Browser::Zen => "Zen",
             Browser::Chrome => "Chrome",
+            Browser::Yandex => "Яндекс Браузер",
             Browser::Safari => "Safari",
             Browser::Brave => "Brave",
             Browser::Helium => "Helium",
@@ -286,7 +290,7 @@ pub fn discover(locations: &Locations) -> Vec<Source> {
 
 /// One browser's source, if it is on this device with something to import.
 pub fn source(locations: &Locations, browser: Browser) -> Option<Source> {
-    let profiles = match browser {
+    let mut profiles = match browser {
         Browser::Safari => return safari::source(locations),
         Browser::Arc => arc::profiles(locations),
         browser if browser.is_firefox_family() => firefox::profiles(locations, browser),
@@ -294,6 +298,14 @@ pub fn source(locations: &Locations, browser: Browser) -> Option<Source> {
             .map(|(_, profiles)| profiles)
             .unwrap_or_default(),
     };
+    // Yandex's history layout has not been qualified; offer only bookmarks.
+    if browser == Browser::Yandex {
+        profiles.retain(|profile| profile.bookmarks);
+        for profile in &mut profiles {
+            profile.history = false;
+            profile.essentials = false;
+        }
+    }
     (!profiles.is_empty()).then_some(Source {
         browser,
         profiles,
@@ -326,6 +338,7 @@ pub fn bookmarks(
     let nodes = match browser {
         Browser::Safari => safari::bookmarks(locations)?,
         Browser::Arc => arc::bookmarks(locations, profile)?,
+        Browser::Yandex => chromium::yandex_bookmarks(&profile_dir(locations, browser, profile)?)?,
         Browser::Zen => {
             let dir = profile_dir(locations, browser, profile)?;
             // The library first, then what each space keeps pinned.
@@ -356,6 +369,7 @@ pub fn history(
     let limit = zephium_core::ports::store::MAX_IMPORTED_VISITS;
     match browser {
         Browser::Safari => safari::history(locations, since, limit),
+        Browser::Yandex => Err(ImportError::Missing),
         browser if browser.is_firefox_family() => {
             firefox::history(&profile_dir(locations, browser, profile)?, since, limit)
         }
@@ -461,11 +475,12 @@ mod tests {
         }
         assert_eq!(Browser::from_id("netscape"), None);
         assert_eq!(
-            Browser::ALL[..7],
+            Browser::ALL[..8],
             [
                 Browser::Arc,
                 Browser::Zen,
                 Browser::Chrome,
+                Browser::Yandex,
                 Browser::Safari,
                 Browser::Brave,
                 Browser::Helium,
@@ -500,6 +515,79 @@ mod tests {
             ]
         );
         assert!(discover(&Locations::scratch(Os::Linux, home.path())).is_empty());
+    }
+
+    #[test]
+    fn yandex_profiles_and_bookmark_roots_are_discovered_and_imported() {
+        for (os, root) in [
+            (Os::Mac, "Library/Application Support/Yandex/YandexBrowser"),
+            (Os::Windows, "Local/Yandex/YandexBrowser/User Data"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join(root);
+            for profile in ["Default", "Profile 1"] {
+                std::fs::create_dir_all(root.join(profile)).unwrap();
+                std::fs::write(root.join(profile).join("Bookmarks"), r#"{"roots":{"bookmark_bar":{"name":"Bar","children":[{"type":"folder","name":"Home","children":[{"type":"url","name":"Film","url":"https://example.com/"}]}]},"other":{"name":"Other","children":[{"type":"url","name":"Other link","url":"https://other.example/"}]},"synced":{"name":"Mobile","children":[]},"collections":{"name":"Избранное","children":[{"type":"folder","name":"Мои ссылки","children":[{"type":"url","name":"Saved","url":"https://saved.example/"}]}]}}}"#.as_bytes()).unwrap();
+            }
+            std::fs::write(root.join("Local State"), br#"{"profile":{"info_cache":{"Default":{"name":"First"},"Profile 1":{"name":"Second"}}}}"#).unwrap();
+            std::fs::write(root.join("Default/History"), b"").unwrap();
+            let locations = Locations::scratch(os, home.path());
+            let source = source(&locations, Browser::Yandex).unwrap();
+            assert_eq!(source.profiles.len(), 2);
+            assert!(source
+                .profiles
+                .iter()
+                .all(|p| p.bookmarks && !p.history && !p.essentials));
+            assert_eq!(source.profiles[0].name, "First");
+            let (nodes, partial) = bookmarks(&locations, Browser::Yandex, "Default").unwrap();
+            assert!(!partial);
+            let titles: Vec<&str> = nodes
+                .iter()
+                .map(|node| match node {
+                    ImportNode::Folder { title, .. } | ImportNode::Link { title, .. } => {
+                        title.as_str()
+                    }
+                })
+                .collect();
+            assert_eq!(titles, ["Home", "Other", "Избранное"]);
+            assert!(
+                matches!(&nodes[2], ImportNode::Folder { children, .. } if matches!(&children[0], ImportNode::Folder { title, children } if title == "Мои ссылки" && children.len() == 1))
+            );
+            assert!(matches!(
+                bookmarks(&locations, Browser::Yandex, "../Default"),
+                Err(ImportError::Missing)
+            ));
+            assert!(matches!(
+                history(&locations, Browser::Yandex, "Default", 1_800_000_000),
+                Err(ImportError::Missing)
+            ));
+        }
+    }
+
+    #[test]
+    fn yandex_requires_a_bookmarks_file_and_rejects_invalid_data() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home
+            .path()
+            .join("Library/Application Support/Yandex/YandexBrowser/Default");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("History"), b"").unwrap();
+        let locations = Locations::scratch(Os::Mac, home.path());
+        assert!(source(&locations, Browser::Yandex).is_none());
+        std::fs::write(root.join("Bookmarks"), b"not json").unwrap();
+        assert!(source(&locations, Browser::Yandex).is_some());
+        assert!(matches!(
+            bookmarks(&locations, Browser::Yandex, "Default"),
+            Err(ImportError::Unreadable)
+        ));
+        std::fs::write(
+            root.join("Bookmarks"),
+            br#"{"roots":{"bookmark_bar":{"children":[]}}}"#,
+        )
+        .unwrap();
+        let (nodes, partial) = bookmarks(&locations, Browser::Yandex, "Default").unwrap();
+        assert!(nodes.is_empty());
+        assert!(!partial);
     }
 
     #[test]

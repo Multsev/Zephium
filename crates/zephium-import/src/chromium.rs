@@ -33,6 +33,7 @@ fn roots(locations: &Locations, browser: Browser) -> Vec<PathBuf> {
         Os::Mac => {
             let parts: &[&str] = match browser {
                 Browser::Chrome => &["Google", "Chrome"],
+                Browser::Yandex => &["Yandex", "YandexBrowser"],
                 Browser::Brave => &["BraveSoftware", "Brave-Browser"],
                 Browser::Edge => &["Microsoft Edge"],
                 Browser::Helium => &["net.imput.helium"],
@@ -57,6 +58,9 @@ fn roots(locations: &Locations, browser: Browser) -> Vec<PathBuf> {
                 |parts: &[&str]| locations.app_data.clone().map(|base| under(base, parts));
             match browser {
                 Browser::Chrome => local(&["Google", "Chrome", "User Data"])
+                    .into_iter()
+                    .collect(),
+                Browser::Yandex => local(&["Yandex", "YandexBrowser", "User Data"])
                     .into_iter()
                     .collect(),
                 Browser::Brave => local(&["BraveSoftware", "Brave-Browser", "User Data"])
@@ -216,6 +220,17 @@ pub(crate) fn profile_dir(
 /// either may hold everything the person sees, and a file that is there but
 /// cannot be read is a failure, not an empty one.
 pub(crate) fn bookmarks(profile: &Path) -> Result<Vec<ImportNode>, ImportError> {
+    read_bookmarks(profile, false)
+}
+
+pub(crate) fn yandex_bookmarks(profile: &Path) -> Result<Vec<ImportNode>, ImportError> {
+    read_bookmarks(profile, true)
+}
+
+fn read_bookmarks(
+    profile: &Path,
+    include_collections: bool,
+) -> Result<Vec<ImportNode>, ImportError> {
     let mut files = Vec::new();
     for name in BOOKMARK_FILES {
         let path = profile.join(name);
@@ -243,7 +258,10 @@ pub(crate) fn bookmarks(profile: &Path) -> Result<Vec<ImportNode>, ImportError> 
     if files.is_empty() {
         return Err(ImportError::Missing);
     }
-    parse_bookmark_files(&files.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    parse_bookmark_files_with_collections(
+        &files.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        include_collections,
+    )
 }
 
 #[cfg(test)]
@@ -272,17 +290,37 @@ impl Root {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_bookmark_files(files: &[&[u8]]) -> Result<Vec<ImportNode>, ImportError> {
-    let (mut bar, mut other, mut mobile) = (Root::default(), Root::default(), Root::default());
+    parse_bookmark_files_with_collections(files, false)
+}
+
+fn parse_bookmark_files_with_collections(
+    files: &[&[u8]],
+    include_collections: bool,
+) -> Result<Vec<ImportNode>, ImportError> {
+    let (mut bar, mut other, mut mobile, mut collections) = (
+        Root::default(),
+        Root::default(),
+        Root::default(),
+        Root::default(),
+    );
     for bytes in files {
         let file: Value = serde_json::from_slice(bytes).map_err(|_| ImportError::Unreadable)?;
         let roots = file.get("roots").ok_or(ImportError::Unreadable)?;
         bar.add(roots.get("bookmark_bar"));
         other.add(roots.get("other"));
         mobile.add(roots.get("synced"));
+        if include_collections {
+            collections.add(roots.get("collections"));
+        }
     }
     let mut nodes = bar.nodes;
-    for (root, fallback) in [(other, "Other bookmarks"), (mobile, "Mobile bookmarks")] {
+    for (root, fallback) in [
+        (other, "Other bookmarks"),
+        (mobile, "Mobile bookmarks"),
+        (collections, "Избранное"),
+    ] {
         if !root.nodes.is_empty() {
             nodes.push(ImportNode::Folder {
                 title: root.name.unwrap_or_else(|| fallback.to_owned()),
