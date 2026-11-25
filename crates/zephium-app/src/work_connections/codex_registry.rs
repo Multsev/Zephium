@@ -1,0 +1,680 @@
+//! Profile-scoped ownership of admitted Codex sessions.
+//! Attaching streams is a native-host capability, never a page or IPC input.
+use super::codex_approval::Answer;
+use super::codex_chat_protocol::TurnEvent;
+use super::codex_client::{Client, ClientError};
+use super::codex_session::Snapshot;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
+use zephium_core::ids::ProfileId;
+
+const MAX_PROFILES: usize = 16;
+type Input = BufReader<Box<dyn AsyncRead + Send + Unpin>>;
+type Output = Box<dyn AsyncWrite + Send + Unpin>;
+type Session = Client<Input, Output>;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegistryError {
+    Busy,
+    Missing,
+    Revoked,
+    Limit,
+    ConsumerGone,
+    Client(ClientError),
+    Internal,
+}
+
+struct Entry {
+    client: AsyncMutex<Session>,
+    snapshot: Mutex<Snapshot>,
+    revoked: watch::Sender<bool>,
+    // A qualified runtime owner keeps its child and sandbox alive here.
+    _lease: Box<dyn Send + Sync>,
+}
+enum Slot {
+    Connecting {
+        id: u64,
+        revoked: watch::Sender<bool>,
+    },
+    Ready(Arc<Entry>),
+}
+struct Reservation<'a> {
+    registry: &'a CodexRegistry,
+    profile: ProfileId,
+    id: u64,
+    active: bool,
+}
+
+struct ActiveOperation<'a> {
+    registry: &'a CodexRegistry,
+    profile: ProfileId,
+    entry: Arc<Entry>,
+    armed: bool,
+}
+impl Drop for ActiveOperation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut slots) = self.registry.entries.lock() {
+            if matches!(slots.get(&self.profile), Some(Slot::Ready(current)) if Arc::ptr_eq(current, &self.entry))
+            {
+                slots.remove(&self.profile);
+                self.entry.revoked.send_replace(true);
+            }
+        }
+    }
+}
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut slots) = self.registry.entries.lock() {
+            if matches!(slots.get(&self.profile), Some(Slot::Connecting { id, .. }) if *id == self.id)
+            {
+                slots.remove(&self.profile);
+            }
+        }
+    }
+}
+#[derive(Default)]
+pub struct CodexRegistry {
+    entries: Mutex<HashMap<ProfileId, Slot>>,
+    next: AtomicU64,
+}
+
+impl CodexRegistry {
+    /// Only a trusted native launcher may provide streams and a runtime lease.
+    /// No filesystem path, process command or credential is accepted from IPC.
+    pub async fn attach<R, W, L>(
+        &self,
+        profile: ProfileId,
+        reader: R,
+        writer: W,
+        lease: L,
+    ) -> Result<Snapshot, RegistryError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+        L: Send + Sync + 'static,
+    {
+        let id = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| RegistryError::Limit)?;
+        let (connecting_revoked, mut connecting_cancel) = watch::channel(false);
+        {
+            let mut slots = self.entries.lock().map_err(|_| RegistryError::Internal)?;
+            if slots.contains_key(&profile) {
+                return Err(RegistryError::Busy);
+            }
+            if slots.len() >= MAX_PROFILES {
+                return Err(RegistryError::Limit);
+            }
+            slots.insert(
+                profile,
+                Slot::Connecting {
+                    id,
+                    revoked: connecting_revoked,
+                },
+            );
+        }
+        let mut reservation = Reservation {
+            registry: self,
+            profile,
+            id,
+            active: true,
+        };
+        let input: Input = BufReader::new(Box::new(reader));
+        let output: Output = Box::new(writer);
+        let connected = tokio::select! {
+            connected = Client::connect(input, output) => connected,
+            _ = connecting_cancel.changed() => return Err(RegistryError::Revoked),
+        };
+        let mut slots = self.entries.lock().map_err(|_| RegistryError::Internal)?;
+        if !matches!(slots.get(&profile), Some(Slot::Connecting { id: current, .. }) if *current == id)
+        {
+            return Err(RegistryError::Revoked);
+        }
+        match connected {
+            Err(error) => {
+                slots.remove(&profile);
+                Err(RegistryError::Client(error))
+            }
+            Ok(client) => {
+                let snapshot = client.snapshot().clone();
+                let (revoked, _) = watch::channel(false);
+                slots.insert(
+                    profile,
+                    Slot::Ready(Arc::new(Entry {
+                        client: AsyncMutex::new(client),
+                        snapshot: Mutex::new(snapshot.clone()),
+                        revoked,
+                        _lease: Box::new(lease),
+                    })),
+                );
+                reservation.active = false;
+                Ok(snapshot)
+            }
+        }
+    }
+
+    pub fn disconnect(&self, profile: ProfileId) -> Result<(), RegistryError> {
+        let removed = self
+            .entries
+            .lock()
+            .map_err(|_| RegistryError::Internal)?
+            .remove(&profile);
+        match removed {
+            Some(Slot::Ready(entry)) => {
+                entry.revoked.send_replace(true);
+                Ok(())
+            }
+            Some(Slot::Connecting { revoked, .. }) => {
+                revoked.send_replace(true);
+                Ok(())
+            }
+            None => Err(RegistryError::Missing),
+        }
+    }
+
+    fn entry(&self, profile: ProfileId) -> Result<Arc<Entry>, RegistryError> {
+        match self
+            .entries
+            .lock()
+            .map_err(|_| RegistryError::Internal)?
+            .get(&profile)
+        {
+            Some(Slot::Ready(entry)) => Ok(entry.clone()),
+            Some(Slot::Connecting { .. }) => Err(RegistryError::Busy),
+            None => Err(RegistryError::Missing),
+        }
+    }
+    fn current(&self, profile: ProfileId, entry: &Arc<Entry>) -> Result<bool, RegistryError> {
+        Ok(
+            matches!(self.entries.lock().map_err(|_| RegistryError::Internal)?.get(&profile), Some(Slot::Ready(current)) if Arc::ptr_eq(current, entry)),
+        )
+    }
+    async fn publish(
+        &self,
+        profile: ProfileId,
+        entry: &Arc<Entry>,
+        sender: &mpsc::Sender<TurnEvent>,
+        event: TurnEvent,
+    ) -> Result<(), RegistryError> {
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), sender.reserve())
+            .await
+            .map_err(|_| RegistryError::ConsumerGone)?
+            .map_err(|_| RegistryError::ConsumerGone)?;
+        let slots = self.entries.lock().map_err(|_| RegistryError::Internal)?;
+        if !matches!(slots.get(&profile), Some(Slot::Ready(current)) if Arc::ptr_eq(current, entry))
+        {
+            return Err(RegistryError::Revoked);
+        }
+        permit.send(event);
+        Ok(())
+    }
+
+    pub async fn snapshot(&self, profile: ProfileId) -> Result<Snapshot, RegistryError> {
+        let entry = self.entry(profile)?;
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        let snapshot = entry
+            .snapshot
+            .lock()
+            .map_err(|_| RegistryError::Internal)?
+            .clone();
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        Ok(snapshot)
+    }
+
+    pub async fn refresh_limits(&self, profile: ProfileId) -> Result<Snapshot, RegistryError> {
+        let entry = self.entry(profile)?;
+        let mut revoked = entry.revoked.subscribe();
+        if *revoked.borrow_and_update() {
+            return Err(RegistryError::Revoked);
+        }
+        let mut client = tokio::select! { lock = entry.client.lock() => lock, _ = revoked.changed() => return Err(RegistryError::Revoked) };
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        let mut operation = ActiveOperation {
+            registry: self,
+            profile,
+            entry: entry.clone(),
+            armed: true,
+        };
+        tokio::select! {
+            result = client.refresh_limits() => { result.map_err(RegistryError::Client)?; },
+            _ = revoked.changed() => return Err(RegistryError::Revoked),
+        }
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        let snapshot = client.snapshot().clone();
+        *entry.snapshot.lock().map_err(|_| RegistryError::Internal)? = snapshot.clone();
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        if client.is_usable() {
+            operation.armed = false;
+        }
+        Ok(snapshot)
+    }
+
+    pub async fn start_thread(
+        &self,
+        profile: ProfileId,
+        model: &str,
+    ) -> Result<String, RegistryError> {
+        let entry = self.entry(profile)?;
+        let mut revoked = entry.revoked.subscribe();
+        if *revoked.borrow_and_update() {
+            return Err(RegistryError::Revoked);
+        }
+        let mut client = tokio::select! { lock = entry.client.lock() => lock, _ = revoked.changed() => return Err(RegistryError::Revoked) };
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        let mut operation = ActiveOperation {
+            registry: self,
+            profile,
+            entry: entry.clone(),
+            armed: true,
+        };
+        let result = tokio::select! {
+            result = client.start_thread(model) => result.map(str::to_owned).map_err(RegistryError::Client),
+            _ = revoked.changed() => return Err(RegistryError::Revoked),
+        };
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        if client.is_usable() {
+            operation.armed = false;
+        }
+        result
+    }
+
+    pub async fn resume_thread(
+        &self,
+        profile: ProfileId,
+        thread: &str,
+    ) -> Result<String, RegistryError> {
+        let entry = self.entry(profile)?;
+        let mut revoked = entry.revoked.subscribe();
+        if *revoked.borrow_and_update() {
+            return Err(RegistryError::Revoked);
+        }
+        let mut client = tokio::select! { lock = entry.client.lock() => lock, _ = revoked.changed() => return Err(RegistryError::Revoked) };
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        let mut operation = ActiveOperation {
+            registry: self,
+            profile,
+            entry: entry.clone(),
+            armed: true,
+        };
+        let result = tokio::select! {
+            result = client.resume_thread(thread) => result.map(str::to_owned).map_err(RegistryError::Client),
+            _ = revoked.changed() => return Err(RegistryError::Revoked),
+        };
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        if client.is_usable() {
+            operation.armed = false;
+        }
+        result
+    }
+
+    pub async fn turn(
+        &self,
+        profile: ProfileId,
+        prompt: &str,
+        sender: &mpsc::Sender<TurnEvent>,
+        cancel: &mut watch::Receiver<bool>,
+        answers: &mut mpsc::Receiver<Answer>,
+    ) -> Result<TurnEvent, RegistryError> {
+        let entry = self.entry(profile)?;
+        let mut revoked = entry.revoked.subscribe();
+        if *revoked.borrow_and_update() {
+            return Err(RegistryError::Revoked);
+        }
+        let mut client = tokio::select! { lock = entry.client.lock() => lock, _ = revoked.changed() => return Err(RegistryError::Revoked) };
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        let mut operation = ActiveOperation {
+            registry: self,
+            profile,
+            entry: entry.clone(),
+            armed: true,
+        };
+        let (events, mut receive) = mpsc::channel(32);
+        let result = {
+            let run = client.turn_with_approvals(prompt, &events, cancel, answers);
+            tokio::pin!(run);
+            loop {
+                tokio::select! {
+                    result = &mut run => break result.map_err(RegistryError::Client),
+                    event = receive.recv() => match event {
+                        Some(event) => self.publish(profile, &entry, sender, event).await?,
+                        None => return Err(RegistryError::ConsumerGone),
+                    },
+                    _ = revoked.changed() => return Err(RegistryError::Revoked),
+                }
+            }
+        };
+        while let Ok(event) = receive.try_recv() {
+            self.publish(profile, &entry, sender, event).await?;
+        }
+        if !self.current(profile, &entry)? {
+            return Err(RegistryError::Revoked);
+        }
+        if client.is_usable() {
+            operation.armed = false;
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt};
+
+    struct Lease(Arc<AtomicBool>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_scope_and_disconnect_release_runtime_lease() {
+        let registry = CodexRegistry::default();
+        let owner = ProfileId::generate();
+        let other = ProfileId::generate();
+        let (client, server) = duplex(2048);
+        let (read, write) = tokio::io::split(client);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let fake = tokio::spawn(async move {
+            let mut read = BufReader::new(server_read);
+            for response in [
+                Some("{\"id\":1,\"result\":{}}\n"),
+                None,
+                Some("{\"id\":2,\"result\":{\"account\":null}}\n"),
+            ] {
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                if let Some(response) = response {
+                    server_write.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        let snapshot = registry
+            .attach(owner, read, write, Lease(dropped.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.account,
+            super::super::codex_protocol::Account::SignedOut
+        );
+        assert_eq!(registry.snapshot(other).await, Err(RegistryError::Missing));
+        assert_eq!(registry.disconnect(other), Err(RegistryError::Missing));
+        registry.disconnect(owner).unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(registry.snapshot(owner).await, Err(RegistryError::Missing));
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_handshake_does_not_reserve_profile_forever() {
+        let registry = CodexRegistry::default();
+        let profile = ProfileId::generate();
+        let (client, _server) = duplex(2048);
+        let (read, write) = tokio::io::split(client);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            registry.attach(profile, read, write, ())
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            registry.snapshot(profile).await,
+            Err(RegistryError::Missing)
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_pending_handshake() {
+        let registry = Arc::new(CodexRegistry::default());
+        let profile = ProfileId::generate();
+        let (client, server) = duplex(2048);
+        let (read, write) = tokio::io::split(client);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = registry.clone();
+        let lease = Lease(dropped.clone());
+        let task = tokio::spawn(async move { owner.attach(profile, read, write, lease).await });
+        let mut server = BufReader::new(server);
+        let mut line = String::new();
+        server.read_line(&mut line).await.unwrap();
+        registry.disconnect(profile).unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(RegistryError::Revoked)
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn old_cancelled_connect_does_not_remove_replacement() {
+        let registry = Arc::new(CodexRegistry::default());
+        let profile = ProfileId::generate();
+        let (old, server) = duplex(2048);
+        let (read, write) = tokio::io::split(old);
+        let owner = registry.clone();
+        let old_task = tokio::spawn(async move { owner.attach(profile, read, write, ()).await });
+        let mut server = BufReader::new(server);
+        let mut line = String::new();
+        server.read_line(&mut line).await.unwrap();
+        registry.disconnect(profile).unwrap();
+        let (new, server) = duplex(2048);
+        let (read, write) = tokio::io::split(new);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let fake = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_read);
+            for response in [
+                Some("{\"id\":1,\"result\":{}}\n"),
+                None,
+                Some("{\"id\":2,\"result\":{\"account\":null}}\n"),
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if let Some(response) = response {
+                    server_write.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        registry.attach(profile, read, write, ()).await.unwrap();
+        assert_eq!(old_task.await.unwrap(), Err(RegistryError::Revoked));
+        assert!(registry.snapshot(profile).await.is_ok());
+        registry.disconnect(profile).unwrap();
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoning_thread_start_removes_ambiguous_session() {
+        use serde_json::{json, Value};
+        let registry = Arc::new(CodexRegistry::default());
+        let profile = ProfileId::generate();
+        let (client, server) = duplex(4096);
+        let (read, write) = tokio::io::split(client);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let (started, start_seen) = tokio::sync::oneshot::channel();
+        let fake = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_read);
+            for result in [
+                Some(json!({})),
+                None,
+                Some(json!({"account":{"type":"chatgpt","planType":"pro"}})),
+                Some(json!({"rateLimits":{}})),
+                Some(json!({"data":[{"model":"a","displayName":"A","isDefault":true}]})),
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                if let Some(result) = result {
+                    server_write
+                        .write_all(
+                            format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["method"],
+                "thread/start"
+            );
+            started.send(()).unwrap();
+            line.clear();
+            assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        registry
+            .attach(profile, read, write, Lease(dropped.clone()))
+            .await
+            .unwrap();
+        let owner = registry.clone();
+        let operation = tokio::spawn(async move { owner.start_thread(profile, "a").await });
+        start_seen.await.unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            registry.snapshot(profile).await,
+            Err(RegistryError::Missing)
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_revokes_in_flight_turn_and_releases_lease() {
+        use serde_json::{json, Value};
+        use tokio::sync::oneshot;
+        let registry = Arc::new(CodexRegistry::default());
+        let profile = ProfileId::generate();
+        let (client, server) = duplex(8192);
+        let (read, write) = tokio::io::split(client);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let (release, released) = oneshot::channel();
+        let fake = tokio::spawn(async move {
+            let mut read = BufReader::new(server_read);
+            for (method, result) in [
+                ("initialize", Some(json!({}))),
+                ("initialized", None),
+                (
+                    "account/read",
+                    Some(json!({"account":{"type":"chatgpt","planType":"pro"}})),
+                ),
+                ("account/rateLimits/read", Some(json!({"rateLimits":{}}))),
+                (
+                    "model/list",
+                    Some(json!({"data":[{"model":"a","displayName":"A","isDefault":true}]})),
+                ),
+                (
+                    "thread/start",
+                    Some(
+                        json!({"thread":{"id":"t"},"model":"a","sandbox":{"type":"readOnly"},"approvalPolicy":"on-request","approvalsReviewer":"user"}),
+                    ),
+                ),
+                (
+                    "account/rateLimits/read",
+                    Some(json!({"rateLimits":{"primary":{"usedPercent":43}}})),
+                ),
+                ("turn/start", Some(json!({"turn":{"id":"u"}}))),
+            ] {
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                if let Some(result) = result {
+                    server_write
+                        .write_all(
+                            format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            server_write.write_all(b"{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"t\",\"turnId\":\"u\",\"delta\":\"first\"}}\n").await.unwrap();
+            let _ = released.await;
+            let _ = server_write.write_all(b"{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"t\",\"turnId\":\"u\",\"delta\":\"late\"}}\n").await;
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        registry
+            .attach(profile, read, write, Lease(dropped.clone()))
+            .await
+            .unwrap();
+        registry.start_thread(profile, "a").await.unwrap();
+        assert_eq!(
+            registry
+                .refresh_limits(profile)
+                .await
+                .unwrap()
+                .limits
+                .unwrap()[0]
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            43
+        );
+        let (events, mut received) = mpsc::channel(8);
+        let (_cancel, mut cancellation) = watch::channel(false);
+        let (_answers, mut answers) = mpsc::channel(1);
+        let owner = registry.clone();
+        let task = tokio::spawn(async move {
+            owner
+                .turn(profile, "hello", &events, &mut cancellation, &mut answers)
+                .await
+        });
+        assert_eq!(
+            received.recv().await,
+            Some(TurnEvent::Delta("first".into()))
+        );
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            registry.snapshot(profile),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            snapshot.account,
+            super::super::codex_protocol::Account::ChatGpt { .. }
+        ));
+        registry.disconnect(profile).unwrap();
+        let _ = release.send(());
+        assert_eq!(task.await.unwrap(), Err(RegistryError::Revoked));
+        assert!(received.recv().await.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+        fake.await.unwrap();
+    }
+}

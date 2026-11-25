@@ -14,7 +14,7 @@ pub enum SessionError {
     TooManyPages,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub account: Account,
     pub limits: Option<Vec<Limit>>,

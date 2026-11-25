@@ -8,6 +8,7 @@ pub mod codex_approval;
 pub mod codex_chat_protocol;
 pub mod codex_client;
 pub mod codex_protocol;
+pub mod codex_registry;
 pub mod codex_session;
 pub mod codex_transport;
 pub mod codex_turn;

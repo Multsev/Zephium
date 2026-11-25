@@ -336,6 +336,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "thread/resume");
+            assert_eq!(request["params"]["threadId"], "t");
+            server_write.write_all(b"{\"id\":21,\"result\":{\"thread\":{\"id\":\"t\"},\"sandbox\":{\"type\":\"readOnly\"},\"approvalPolicy\":\"on-request\",\"approvalsReviewer\":\"user\"}}\n").await.unwrap();
         });
         let mut client = Client::connect(BufReader::new(reader), writer)
             .await
@@ -363,6 +369,7 @@ mod tests {
                 .used_percent,
             43
         );
+        assert_eq!(client.resume_thread("t").await.unwrap(), "t");
         server_task.await.unwrap();
     }
 }

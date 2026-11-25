@@ -41,7 +41,7 @@ pub struct Outcome {
     pub reusable: bool,
 }
 
-fn deliver(
+async fn deliver(
     event: TurnEvent,
     sender: &mpsc::Sender<TurnEvent>,
     output_bytes: &mut usize,
@@ -61,8 +61,9 @@ fn deliver(
         event,
         TurnEvent::Completed | TurnEvent::Interrupted | TurnEvent::Failed
     );
-    sender
-        .try_send(event.clone())
+    tokio::time::timeout(Duration::from_secs(5), sender.send(event.clone()))
+        .await
+        .map_err(|_| TurnError::ConsumerGone)?
         .map_err(|_| TurnError::ConsumerGone)?;
     Ok(terminal.then_some(event))
 }
@@ -148,7 +149,7 @@ where
     for line in exchange.notifications {
         let event = chat::event(&line, thread, &turn).map_err(TurnError::Protocol)?;
         count += 1;
-        if let Some(status) = deliver(event, sender, &mut output_bytes)? {
+        if let Some(status) = deliver(event, sender, &mut output_bytes).await? {
             return Ok(Outcome {
                 status,
                 reusable: true,
@@ -220,7 +221,8 @@ where
                 TurnEvent::ApprovalRequested(approval.clone()),
                 sender,
                 &mut output_bytes,
-            )?;
+            )
+            .await?;
             let mut answer = if *cancel.borrow_and_update() {
                 Answer {
                     nonce: approval.nonce,
@@ -258,7 +260,7 @@ where
             continue;
         }
         let event = chat::event(&bytes, thread, &turn).map_err(TurnError::Protocol)?;
-        if let Some(status) = deliver(event, sender, &mut output_bytes)? {
+        if let Some(status) = deliver(event, sender, &mut output_bytes).await? {
             return Ok(Outcome {
                 status,
                 reusable: !interrupt_pending,
@@ -273,15 +275,38 @@ mod tests {
     use tokio::io::{duplex, AsyncBufReadExt, BufReader};
     use tokio::sync::oneshot;
 
-    #[test]
-    fn output_limit_is_enforced_before_delivery() {
+    #[tokio::test]
+    async fn output_limit_is_enforced_before_delivery() {
         let (events, mut received) = mpsc::channel(1);
         let mut size = MAX_OUTPUT_BYTES;
         assert_eq!(
-            deliver(TurnEvent::Delta("x".into()), &events, &mut size),
+            deliver(TurnEvent::Delta("x".into()), &events, &mut size).await,
             Err(TurnError::TooManyEvents)
         );
         assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_applies_backpressure_without_losing_text() {
+        let (events, mut received) = mpsc::channel(1);
+        let mut size = 0;
+        deliver(TurnEvent::Delta("first".into()), &events, &mut size)
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            deliver(TurnEvent::Delta("second".into()), &events, &mut size).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(
+            received.recv().await,
+            Some(TurnEvent::Delta("first".into()))
+        );
+        assert_eq!(task.await.unwrap(), Ok(None));
+        assert_eq!(
+            received.recv().await,
+            Some(TurnEvent::Delta("second".into()))
+        );
     }
 
     #[tokio::test]
