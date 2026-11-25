@@ -96,7 +96,7 @@ fn message(line: &[u8]) -> Result<Value, ProtocolError> {
     serde_json::from_slice(line).map_err(|_| ProtocolError::Malformed)
 }
 
-fn response(line: &[u8], id: u64) -> Result<Value, ProtocolError> {
+pub(super) fn response(line: &[u8], id: u64) -> Result<Value, ProtocolError> {
     let value = message(line)?;
     if value.get("id").and_then(Value::as_u64) != Some(id) {
         return Err(ProtocolError::Unexpected);

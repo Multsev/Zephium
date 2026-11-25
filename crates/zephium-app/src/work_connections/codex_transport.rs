@@ -5,7 +5,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_INTERLEAVED: usize = 64;
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TransportError {
@@ -13,6 +15,63 @@ pub enum TransportError {
     Timeout,
     Closed,
     Protocol(ProtocolError),
+}
+
+pub enum ChatRequest<'a> {
+    StartThread { model: &'a str },
+    ResumeThread { thread: &'a str },
+    StartTurn { thread: &'a str, prompt: &'a str },
+    InterruptTurn { thread: &'a str, turn: &'a str },
+}
+
+pub struct ChatExchange {
+    pub response: Vec<u8>,
+    pub notifications: Vec<Vec<u8>>,
+}
+
+/// Read the next event for one active turn. Dropping this future cancels the
+/// read, but the owner must then close the stream rather than reuse it.
+pub async fn next_chat_event<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    thread: &str,
+    turn: &str,
+) -> Result<super::codex_chat_protocol::TurnEvent, TransportError> {
+    use super::codex_chat_protocol::{event, TurnEvent};
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        for _ in 0..MAX_INTERLEAVED {
+            let line = read_line(reader).await?;
+            match event(&line, thread, turn).map_err(TransportError::Protocol)? {
+                TurnEvent::Other => continue,
+                item => return Ok(item),
+            }
+        }
+        Err(TransportError::Protocol(ProtocolError::TooLarge))
+    })
+    .await
+    .map_err(|_| TransportError::Timeout)?
+}
+
+/// Preserve bounded notifications which arrive before a chat response. Any
+/// server-initiated request fails closed until an approval handler owns it.
+pub async fn chat_request<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    operation: ChatRequest<'_>,
+    id: u64,
+) -> Result<ChatExchange, TransportError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use super::codex_chat_protocol as chat;
+    let line = match operation {
+        ChatRequest::StartThread { model } => chat::start_thread(id, model),
+        ChatRequest::ResumeThread { thread } => chat::resume_thread(id, thread),
+        ChatRequest::StartTurn { thread, prompt } => chat::start_turn(id, thread, prompt),
+        ChatRequest::InterruptTurn { thread, turn } => chat::interrupt_turn(id, thread, turn),
+    }
+    .map_err(TransportError::Protocol)?;
+    exchange(reader, writer, line, id, true).await
 }
 
 pub async fn initialized<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), TransportError> {
@@ -94,12 +153,28 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    Ok(exchange(reader, writer, line, id, false).await?.response)
+}
+
+async fn exchange<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    line: String,
+    id: u64,
+    retain: bool,
+) -> Result<ChatExchange, TransportError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         writer
             .write_all(line.as_bytes())
             .await
             .map_err(|_| TransportError::Io)?;
         writer.flush().await.map_err(|_| TransportError::Io)?;
+        let mut notifications = Vec::new();
+        let mut total = 0usize;
         for _ in 0..MAX_INTERLEAVED {
             let line = read_line(reader).await?;
             let value: Value = serde_json::from_slice(&line)
@@ -111,12 +186,24 @@ where
                 if value.get("id").is_some() {
                     return Err(TransportError::Protocol(ProtocolError::Unexpected));
                 }
+                if retain {
+                    total = total
+                        .checked_add(line.len())
+                        .ok_or(TransportError::Protocol(ProtocolError::TooLarge))?;
+                    if total > MAX_PENDING_BYTES {
+                        return Err(TransportError::Protocol(ProtocolError::TooLarge));
+                    }
+                    notifications.push(line);
+                }
                 continue;
             }
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 return Err(TransportError::Protocol(ProtocolError::Unexpected));
             }
-            return Ok(line);
+            return Ok(ChatExchange {
+                response: line,
+                notifications,
+            });
         }
         Err(TransportError::Protocol(ProtocolError::TooLarge))
     })
@@ -174,5 +261,40 @@ mod tests {
             read_line(&mut oversized).await,
             Err(TransportError::Protocol(ProtocolError::TooLarge))
         );
+    }
+
+    #[tokio::test]
+    async fn chat_preserves_notifications_arriving_before_response() {
+        let (client, mut server) = duplex(2048);
+        let (read, mut write) = tokio::io::split(client);
+        let task = tokio::spawn(async move {
+            let mut input = [0u8; 1024];
+            let _ = server.read(&mut input).await.unwrap();
+            server.write_all(b"{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"t\",\"turnId\":\"u\",\"delta\":\"Hi\"}}\n{\"id\":2,\"result\":{\"turn\":{\"id\":\"u\"}}}\n{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"t\",\"turn\":{\"id\":\"u\",\"status\":\"completed\"}}}\n").await.unwrap();
+        });
+        let mut reader = BufReader::new(read);
+        let result = chat_request(
+            &mut reader,
+            &mut write,
+            ChatRequest::StartTurn {
+                thread: "t",
+                prompt: "Hello",
+            },
+            2,
+        )
+        .await
+        .unwrap();
+        let turn = super::super::codex_chat_protocol::turn_response(&result.response, 2).unwrap();
+        assert_eq!(
+            super::super::codex_chat_protocol::event(&result.notifications[0], "t", &turn),
+            Ok(super::super::codex_chat_protocol::TurnEvent::Delta(
+                "Hi".into()
+            ))
+        );
+        assert_eq!(
+            next_chat_event(&mut reader, "t", &turn).await,
+            Ok(super::super::codex_chat_protocol::TurnEvent::Completed)
+        );
+        task.await.unwrap();
     }
 }
