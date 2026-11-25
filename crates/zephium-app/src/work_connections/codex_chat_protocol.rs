@@ -134,6 +134,9 @@ pub fn event(line: &[u8], thread: &str, turn: &str) -> Result<TurnEvent, Protoco
     if value.get("id").is_some() {
         return Err(ProtocolError::Unexpected);
     }
+    if method == "account/updated" {
+        return Err(ProtocolError::Unexpected);
+    }
     if method != "item/agentMessage/delta" && method != "turn/completed" {
         return Ok(TurnEvent::Other);
     }
@@ -215,6 +218,10 @@ mod tests {
         assert_eq!(event(line, "t", "other"), Err(ProtocolError::Unexpected));
         let done=br#"{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"interrupted"}}}"#;
         assert_eq!(event(done, "t", "u"), Ok(TurnEvent::Interrupted));
+        assert_eq!(
+            event(br#"{"method":"account/updated","params":{}}"#, "t", "u"),
+            Err(ProtocolError::Unexpected)
+        );
         assert_eq!(
             event(br#"{"id":3,"method":"item/agentMessage/delta"}"#, "t", "u"),
             Err(ProtocolError::Unexpected)

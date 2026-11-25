@@ -188,6 +188,9 @@ where
                 if value.get("id").is_some() {
                     return Err(TransportError::Protocol(ProtocolError::Unexpected));
                 }
+                if value.get("method").and_then(Value::as_str) == Some("account/updated") {
+                    return Err(TransportError::Protocol(ProtocolError::Unexpected));
+                }
                 if retain {
                     total = total
                         .checked_add(line.len())
@@ -228,7 +231,7 @@ mod tests {
             assert!(std::str::from_utf8(&input[..count])
                 .unwrap()
                 .contains("account/read"));
-            server.write_all(b"{\"method\":\"account/updated\",\"params\":{}}\n{\"id\":2,\"result\":{\"account\":null}}\n").await.unwrap();
+            server.write_all(b"{\"method\":\"account/rateLimits/updated\",\"params\":{}}\n{\"id\":2,\"result\":{\"account\":null}}\n").await.unwrap();
         });
         let result = request(&mut BufReader::new(read), &mut write, Request::Account, 2)
             .await
@@ -263,6 +266,25 @@ mod tests {
             read_line(&mut oversized).await,
             Err(TransportError::Protocol(ProtocolError::TooLarge))
         );
+    }
+
+    #[tokio::test]
+    async fn account_change_invalidates_an_in_flight_request() {
+        let (client, mut server) = duplex(1024);
+        let (read, mut write) = tokio::io::split(client);
+        let task = tokio::spawn(async move {
+            let mut input = [0u8; 512];
+            let _ = server.read(&mut input).await.unwrap();
+            server
+                .write_all(b"{\"method\":\"account/updated\",\"params\":{}}\n")
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            request(&mut BufReader::new(read), &mut write, Request::Account, 2).await,
+            Err(TransportError::Protocol(ProtocolError::Unexpected))
+        );
+        task.await.unwrap();
     }
 
     #[tokio::test]

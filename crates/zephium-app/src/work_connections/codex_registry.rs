@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use zephium_core::ids::ProfileId;
 
 const MAX_PROFILES: usize = 16;
-const MAX_KNOWN_PROFILES: usize = 64;
+const MAX_THREAD_OWNERS: usize = 64;
 const MAX_THREADS: usize = 512;
 type Input = BufReader<Box<dyn AsyncRead + Send + Unpin>>;
 type Output = Box<dyn AsyncWrite + Send + Unpin>;
@@ -33,9 +33,26 @@ pub enum RegistryError {
 struct Entry {
     client: AsyncMutex<Session>,
     snapshot: Mutex<Snapshot>,
+    account: AccountScope,
     revoked: watch::Sender<bool>,
     // A qualified runtime owner keeps its child and sandbox alive here.
     _lease: Box<dyn Send + Sync>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum AccountScope {
+    Email(String),
+    /// An account without a usable identity can resume only in this session.
+    Session(u64),
+}
+
+fn account_scope(account: &super::codex_protocol::Account, session: u64) -> AccountScope {
+    match account {
+        super::codex_protocol::Account::ChatGpt {
+            email: Some(email), ..
+        } => AccountScope::Email(email.clone()),
+        _ => AccountScope::Session(session),
+    }
 }
 enum Slot {
     Connecting {
@@ -87,7 +104,7 @@ impl Drop for Reservation<'_> {
 #[derive(Default)]
 pub struct CodexRegistry {
     entries: Mutex<HashMap<ProfileId, Slot>>,
-    threads: Mutex<HashMap<ProfileId, HashSet<String>>>,
+    threads: Mutex<HashMap<(ProfileId, AccountScope), HashSet<String>>>,
     next: AtomicU64,
 }
 
@@ -151,12 +168,14 @@ impl CodexRegistry {
             }
             Ok(client) => {
                 let snapshot = client.snapshot().clone();
+                let account = account_scope(&snapshot.account, id);
                 let (revoked, _) = watch::channel(false);
                 slots.insert(
                     profile,
                     Slot::Ready(Arc::new(Entry {
                         client: AsyncMutex::new(client),
                         snapshot: Mutex::new(snapshot.clone()),
+                        account,
                         revoked,
                         _lease: Box::new(lease),
                     })),
@@ -192,7 +211,7 @@ impl CodexRegistry {
         let mut slots = self.entries.lock().map_err(|_| RegistryError::Internal)?;
         let mut threads = self.threads.lock().map_err(|_| RegistryError::Internal)?;
         let removed = slots.remove(&profile);
-        threads.remove(&profile);
+        threads.retain(|(owner, _), _| *owner != profile);
         drop(threads);
         drop(slots);
         match removed {
@@ -310,10 +329,11 @@ impl CodexRegistry {
         }
         {
             let threads = self.threads.lock().map_err(|_| RegistryError::Internal)?;
+            let owner = (profile, entry.account.clone());
             if threads
-                .get(&profile)
+                .get(&owner)
                 .is_some_and(|items| items.len() >= MAX_THREADS)
-                || (!threads.contains_key(&profile) && threads.len() >= MAX_KNOWN_PROFILES)
+                || (!threads.contains_key(&owner) && threads.len() >= MAX_THREAD_OWNERS)
             {
                 return Err(RegistryError::Limit);
             }
@@ -338,10 +358,11 @@ impl CodexRegistry {
                 return Err(RegistryError::Revoked);
             }
             let mut threads = self.threads.lock().map_err(|_| RegistryError::Internal)?;
-            if !threads.contains_key(&profile) && threads.len() >= MAX_KNOWN_PROFILES {
+            let owner = (profile, entry.account.clone());
+            if !threads.contains_key(&owner) && threads.len() >= MAX_THREAD_OWNERS {
                 return Err(RegistryError::Limit);
             }
-            threads.entry(profile).or_default().insert(thread.clone());
+            threads.entry(owner).or_default().insert(thread.clone());
         }
         if client.is_usable() {
             operation.armed = false;
@@ -367,7 +388,7 @@ impl CodexRegistry {
             .threads
             .lock()
             .map_err(|_| RegistryError::Internal)?
-            .get(&profile)
+            .get(&(profile, entry.account.clone()))
             .is_some_and(|threads| threads.contains(thread))
         {
             return Err(RegistryError::UnknownThread);
@@ -453,6 +474,26 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn known_threads_are_bound_to_account_or_single_session() {
+        use super::super::codex_protocol::Account;
+        let first = Account::ChatGpt {
+            email: Some("one@example.com".into()),
+            plan: "pro".into(),
+        };
+        let second = Account::ChatGpt {
+            email: Some("two@example.com".into()),
+            plan: "pro".into(),
+        };
+        let anonymous = Account::ChatGpt {
+            email: None,
+            plan: "pro".into(),
+        };
+        assert!(account_scope(&first, 1) == account_scope(&first, 2));
+        assert!(account_scope(&first, 1) != account_scope(&second, 1));
+        assert!(account_scope(&anonymous, 1) != account_scope(&anonymous, 2));
     }
 
     #[tokio::test]
@@ -742,9 +783,19 @@ mod tests {
         assert_eq!(task.await.unwrap(), Err(RegistryError::Revoked));
         assert!(received.recv().await.is_none());
         assert!(dropped.load(Ordering::SeqCst));
-        assert!(registry.threads.lock().unwrap().contains_key(&profile));
+        assert!(registry
+            .threads
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(owner, _)| *owner == profile));
         registry.forget_profile(profile).unwrap();
-        assert!(!registry.threads.lock().unwrap().contains_key(&profile));
+        assert!(!registry
+            .threads
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(owner, _)| *owner == profile));
         fake.await.unwrap();
     }
 }
