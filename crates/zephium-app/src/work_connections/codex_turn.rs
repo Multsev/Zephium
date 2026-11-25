@@ -347,7 +347,7 @@ mod tests {
             let mut reader = BufReader::new(server_read);
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
-            server_write.write_all(b"{\"id\":101,\"result\":{\"turn\":{\"id\":\"u\"}}}\n{\"id\":7,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"threadId\":\"t\",\"turnId\":\"u\",\"command\":\"ls\"}}\n").await.unwrap();
+            server_write.write_all(b"{\"id\":101,\"result\":{\"turn\":{\"id\":\"u\"}}}\n{\"id\":7,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"threadId\":\"t\",\"turnId\":\"u\",\"command\":\"ls\",\"cwd\":\"/tmp\"}}\n").await.unwrap();
             line.clear();
             reader.read_line(&mut line).await.unwrap();
             let response: Value = serde_json::from_str(&line).unwrap();

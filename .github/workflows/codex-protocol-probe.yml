@@ -35,5 +35,7 @@ jobs:
         run: npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/zephium-codex-probe" @openai/codex@0.147.0
       - name: Install project Rust toolchain
         run: rustup toolchain install --profile minimal
+      - name: Check protocol, session and approval behavior
+        run: cargo test -p zephium-app --locked --features work-runtime,work-execution work_connections::codex_
       - name: Check real CLI handshake with a blank temporary account
         run: cargo test -p zephium-app --locked --features work-runtime,work-execution native_codex_signed_out -- --ignored

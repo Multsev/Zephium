@@ -11,7 +11,7 @@ pub struct Approval {
     /// Unique within the active turn, assigned by Zephium.
     pub nonce: u64,
     pub command: String,
-    pub cwd: Option<String>,
+    pub cwd: String,
     pub reason: Option<String>,
     server_id: Value,
 }
@@ -105,10 +105,13 @@ pub fn parse(line: &[u8], thread: &str, turn: &str, nonce: u64) -> Result<Approv
     let command = optional_text(params.get("command"), MAX_COMMAND)?
         .filter(|s| !s.trim().is_empty())
         .ok_or(ProtocolError::Malformed)?;
+    let cwd = optional_text(params.get("cwd"), MAX_DETAIL)?
+        .filter(|s| !s.trim().is_empty() && !s.chars().any(char::is_control))
+        .ok_or(ProtocolError::Malformed)?;
     Ok(Approval {
         nonce,
         command,
-        cwd: optional_text(params.get("cwd"), MAX_DETAIL)?,
+        cwd,
         reason: optional_text(params.get("reason"), MAX_DETAIL)?,
         server_id: id.clone(),
     })
@@ -174,5 +177,10 @@ mod tests {
         assert_eq!(parse(network, "t", "u", 7), Err(ProtocolError::Unexpected));
         let unknown = br#"{"id":1,"method":"item/commandExecution/requestApproval","params":{"threadId":"t","turnId":"u","command":"ls","futureScope":"anything"}}"#;
         assert_eq!(parse(unknown, "t", "u", 7), Err(ProtocolError::Unexpected));
+        let missing_cwd = br#"{"id":1,"method":"item/commandExecution/requestApproval","params":{"threadId":"t","turnId":"u","command":"ls"}}"#;
+        assert_eq!(
+            parse(missing_cwd, "t", "u", 7),
+            Err(ProtocolError::Malformed)
+        );
     }
 }
