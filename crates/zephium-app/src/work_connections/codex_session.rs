@@ -49,7 +49,11 @@ where
     let limits = transport::request(reader, writer, Request::Limits, 3)
         .await
         .map_err(SessionError::Transport)?;
-    let limits = protocol::limits_response(&limits, 3).map_err(SessionError::Protocol)?;
+    let limits = match protocol::limits_response(&limits, 3) {
+        Ok(limits) => Some(limits),
+        Err(ProtocolError::Remote) => None,
+        Err(error) => return Err(SessionError::Protocol(error)),
+    };
     let line = transport::request(reader, writer, Request::Models, 4)
         .await
         .map_err(SessionError::Transport)?;
@@ -75,7 +79,7 @@ where
     }
     Ok(Snapshot {
         account,
-        limits: Some(limits),
+        limits,
         models,
     })
 }
@@ -85,6 +89,41 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn unavailable_limits_do_not_hide_account_or_models() {
+        let (client, server) = duplex(4096);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let task = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_read);
+            for response in [
+                Some(json!({"id":1,"result":{}})),
+                None,
+                Some(json!({"id":2,"result":{"account":{"type":"chatgpt","planType":"pro"}}})),
+                Some(json!({"id":3,"error":{"code":-32000,"message":"unavailable"}})),
+                Some(
+                    json!({"id":4,"result":{"data":[{"model":"a","displayName":"A","isDefault":true}]}}),
+                ),
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if let Some(value) = response {
+                    server_write
+                        .write_all(format!("{value}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let snapshot = read_snapshot(&mut BufReader::new(client_read), &mut client_write)
+            .await
+            .unwrap();
+        assert!(matches!(snapshot.account, Account::ChatGpt { .. }));
+        assert_eq!(snapshot.limits, None);
+        assert_eq!(snapshot.models[0].id, "a");
+        task.await.unwrap();
+    }
 
     #[tokio::test]
     async fn handshake_discovers_multiple_model_pages() {

@@ -71,6 +71,21 @@ fn nested_id(line: &[u8], id: u64, field: &str) -> Result<String, ProtocolError>
         .ok_or(ProtocolError::Malformed)
 }
 pub fn thread_response(line: &[u8], id: u64) -> Result<String, ProtocolError> {
+    let result = codex_protocol::response(line, id)?;
+    let sandbox = result.get("sandbox").ok_or(ProtocolError::Malformed)?;
+    if sandbox.get("type").and_then(Value::as_str) != Some("readOnly")
+        || !matches!(
+            sandbox.get("networkAccess"),
+            None | Some(Value::Bool(false))
+        )
+        || !matches!(
+            result.get("approvalPolicy").and_then(Value::as_str),
+            Some("on-request" | "untrusted")
+        )
+        || result.get("approvalsReviewer").and_then(Value::as_str) != Some("user")
+    {
+        return Err(ProtocolError::Unexpected);
+    }
     nested_id(line, id, "thread")
 }
 pub fn turn_response(line: &[u8], id: u64) -> Result<String, ProtocolError> {
@@ -152,10 +167,29 @@ mod tests {
             Err(ProtocolError::TooLarge)
         );
         assert!(interrupt_turn(2, "thread\n", "turn").is_err());
+        let safe = br#"{"id":1,"result":{"thread":{"id":"abc"},"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"on-request","approvalsReviewer":"user"}}"#;
+        assert_eq!(thread_response(safe, 1).unwrap(), "abc");
+        let unsafe_policy = br#"{"id":1,"result":{"thread":{"id":"abc"},"sandbox":{"type":"dangerFullAccess"},"approvalPolicy":"never","approvalsReviewer":"user"}}"#;
         assert_eq!(
-            thread_response(br#"{"id":1,"result":{"thread":{"id":"abc"}}}"#, 1).unwrap(),
-            "abc"
+            thread_response(unsafe_policy, 1),
+            Err(ProtocolError::Unexpected)
         );
+        for (field, value) in [
+            ("network", json!(true)),
+            ("reviewer", json!("auto_review")),
+            ("approval", json!("never")),
+        ] {
+            let mut changed: Value = serde_json::from_slice(safe).unwrap();
+            match field {
+                "network" => changed["result"]["sandbox"]["networkAccess"] = value,
+                "reviewer" => changed["result"]["approvalsReviewer"] = value,
+                _ => changed["result"]["approvalPolicy"] = value,
+            }
+            assert_eq!(
+                thread_response(changed.to_string().as_bytes(), 1),
+                Err(ProtocolError::Unexpected)
+            );
+        }
     }
     #[test]
     fn events_are_scoped_to_the_active_turn() {

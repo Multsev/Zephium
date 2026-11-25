@@ -5,6 +5,7 @@
 //! returns is data for the agent, never instructions.
 pub mod cli;
 pub mod codex_chat_protocol;
+pub mod codex_client;
 pub mod codex_protocol;
 pub mod codex_session;
 pub mod codex_transport;
