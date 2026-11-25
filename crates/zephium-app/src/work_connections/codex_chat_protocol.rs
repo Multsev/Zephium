@@ -92,7 +92,7 @@ pub fn turn_response(line: &[u8], id: u64) -> Result<String, ProtocolError> {
     nested_id(line, id, "turn")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum TurnEvent {
     Delta(String),
     ApprovalRequested(super::codex_approval::Approval),
@@ -100,6 +100,21 @@ pub enum TurnEvent {
     Interrupted,
     Failed,
     Other,
+}
+
+impl std::fmt::Debug for TurnEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Delta(_) => f.write_str("Delta(<redacted>)"),
+            Self::ApprovalRequested(approval) => {
+                f.debug_tuple("ApprovalRequested").field(approval).finish()
+            }
+            Self::Completed => f.write_str("Completed"),
+            Self::Interrupted => f.write_str("Interrupted"),
+            Self::Failed => f.write_str("Failed"),
+            Self::Other => f.write_str("Other"),
+        }
+    }
 }
 
 /// Parse notifications only for the active turn. Error details and unrelated
@@ -196,6 +211,7 @@ mod tests {
     fn events_are_scoped_to_the_active_turn() {
         let line=br#"{"method":"item/agentMessage/delta","params":{"threadId":"t","turnId":"u","delta":"Hi"}}"#;
         assert_eq!(event(line, "t", "u"), Ok(TurnEvent::Delta("Hi".into())));
+        assert!(!format!("{:?}", TurnEvent::Delta("private text".into())).contains("private text"));
         assert_eq!(event(line, "t", "other"), Err(ProtocolError::Unexpected));
         let done=br#"{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"interrupted"}}}"#;
         assert_eq!(event(done, "t", "u"), Ok(TurnEvent::Interrupted));

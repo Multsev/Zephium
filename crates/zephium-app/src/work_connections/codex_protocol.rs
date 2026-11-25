@@ -13,12 +13,23 @@ pub enum ProtocolError {
     Remote,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Account {
     SignedOut,
     ChatGpt { email: Option<String>, plan: String },
     ApiKey,
     Other,
+}
+
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SignedOut => f.write_str("SignedOut"),
+            Self::ChatGpt { .. } => f.write_str("ChatGpt(<redacted>)"),
+            Self::ApiKey => f.write_str("ApiKey"),
+            Self::Other => f.write_str("Other"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +276,14 @@ mod tests {
     }
     #[test]
     fn account_variants_and_remote_errors() {
+        assert!(!format!(
+            "{:?}",
+            Account::ChatGpt {
+                email: Some("private@example.com".into()),
+                plan: "pro".into()
+            }
+        )
+        .contains("private@example.com"));
         assert_eq!(
             account_response(br#"{"id":1,"result":{"account":null}}"#, 1),
             Ok(Account::SignedOut)
