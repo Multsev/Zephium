@@ -163,6 +163,31 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Client<R, W> {
         self.usable = result.reusable;
         Ok(result.status)
     }
+
+    pub async fn turn_with_approvals(
+        &mut self,
+        prompt: &str,
+        events: &mpsc::Sender<TurnEvent>,
+        cancel: &mut watch::Receiver<bool>,
+        answers: &mut mpsc::Receiver<super::codex_approval::Answer>,
+    ) -> Result<TurnEvent, ClientError> {
+        self.ready()?;
+        let thread = self.thread.as_deref().ok_or(ClientError::NoThread)?;
+        self.usable = false;
+        let result = codex_turn::stream_turn_with_approvals(
+            &mut self.reader,
+            &mut self.writer,
+            thread,
+            prompt,
+            events,
+            cancel,
+            answers,
+        )
+        .await
+        .map_err(ClientError::Turn)?;
+        self.usable = result.reusable;
+        Ok(result.status)
+    }
 }
 
 #[cfg(test)]

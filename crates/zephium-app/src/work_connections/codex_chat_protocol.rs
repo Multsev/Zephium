@@ -95,6 +95,7 @@ pub fn turn_response(line: &[u8], id: u64) -> Result<String, ProtocolError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnEvent {
     Delta(String),
+    ApprovalRequested(super::codex_approval::Approval),
     Completed,
     Interrupted,
     Failed,
