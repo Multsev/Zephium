@@ -77,7 +77,7 @@ pub fn turn_response(line: &[u8], id: u64) -> Result<String, ProtocolError> {
     nested_id(line, id, "turn")
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnEvent {
     Delta(String),
     Completed,

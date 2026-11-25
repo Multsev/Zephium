@@ -87,7 +87,9 @@ pub async fn initialized<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), Tr
 }
 
 /// Read exactly one bounded JSON line without ever allocating past the bound.
-async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, TransportError> {
+pub(super) async fn read_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, TransportError> {
     let mut line = Vec::new();
     loop {
         let bytes = reader.fill_buf().await.map_err(|_| TransportError::Io)?;
