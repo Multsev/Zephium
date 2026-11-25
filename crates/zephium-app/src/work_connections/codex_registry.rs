@@ -4,7 +4,7 @@ use super::codex_approval::Answer;
 use super::codex_chat_protocol::TurnEvent;
 use super::codex_client::{Client, ClientError};
 use super::codex_session::Snapshot;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -12,6 +12,8 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use zephium_core::ids::ProfileId;
 
 const MAX_PROFILES: usize = 16;
+const MAX_KNOWN_PROFILES: usize = 64;
+const MAX_THREADS: usize = 512;
 type Input = BufReader<Box<dyn AsyncRead + Send + Unpin>>;
 type Output = Box<dyn AsyncWrite + Send + Unpin>;
 type Session = Client<Input, Output>;
@@ -23,6 +25,7 @@ pub enum RegistryError {
     Revoked,
     Limit,
     ConsumerGone,
+    UnknownThread,
     Client(ClientError),
     Internal,
 }
@@ -84,6 +87,7 @@ impl Drop for Reservation<'_> {
 #[derive(Default)]
 pub struct CodexRegistry {
     entries: Mutex<HashMap<ProfileId, Slot>>,
+    threads: Mutex<HashMap<ProfileId, HashSet<String>>>,
     next: AtomicU64,
 }
 
@@ -180,6 +184,27 @@ impl CodexRegistry {
             }
             None => Err(RegistryError::Missing),
         }
+    }
+
+    /// Remove both the active session and in-memory thread ownership when the
+    /// browser profile is deleted. Ownership is not yet persisted on disk.
+    pub fn forget_profile(&self, profile: ProfileId) -> Result<(), RegistryError> {
+        let mut slots = self.entries.lock().map_err(|_| RegistryError::Internal)?;
+        let mut threads = self.threads.lock().map_err(|_| RegistryError::Internal)?;
+        let removed = slots.remove(&profile);
+        threads.remove(&profile);
+        drop(threads);
+        drop(slots);
+        match removed {
+            Some(Slot::Ready(entry)) => {
+                entry.revoked.send_replace(true);
+            }
+            Some(Slot::Connecting { revoked, .. }) => {
+                revoked.send_replace(true);
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     fn entry(&self, profile: ProfileId) -> Result<Arc<Entry>, RegistryError> {
@@ -283,6 +308,16 @@ impl CodexRegistry {
         if !self.current(profile, &entry)? {
             return Err(RegistryError::Revoked);
         }
+        {
+            let threads = self.threads.lock().map_err(|_| RegistryError::Internal)?;
+            if threads
+                .get(&profile)
+                .is_some_and(|items| items.len() >= MAX_THREADS)
+                || (!threads.contains_key(&profile) && threads.len() >= MAX_KNOWN_PROFILES)
+            {
+                return Err(RegistryError::Limit);
+            }
+        }
         let mut operation = ActiveOperation {
             registry: self,
             profile,
@@ -295,6 +330,18 @@ impl CodexRegistry {
         };
         if !self.current(profile, &entry)? {
             return Err(RegistryError::Revoked);
+        }
+        if let Ok(thread) = &result {
+            let slots = self.entries.lock().map_err(|_| RegistryError::Internal)?;
+            if !matches!(slots.get(&profile), Some(Slot::Ready(current)) if Arc::ptr_eq(current, &entry))
+            {
+                return Err(RegistryError::Revoked);
+            }
+            let mut threads = self.threads.lock().map_err(|_| RegistryError::Internal)?;
+            if !threads.contains_key(&profile) && threads.len() >= MAX_KNOWN_PROFILES {
+                return Err(RegistryError::Limit);
+            }
+            threads.entry(profile).or_default().insert(thread.clone());
         }
         if client.is_usable() {
             operation.armed = false;
@@ -315,6 +362,15 @@ impl CodexRegistry {
         let mut client = tokio::select! { lock = entry.client.lock() => lock, _ = revoked.changed() => return Err(RegistryError::Revoked) };
         if !self.current(profile, &entry)? {
             return Err(RegistryError::Revoked);
+        }
+        if !self
+            .threads
+            .lock()
+            .map_err(|_| RegistryError::Internal)?
+            .get(&profile)
+            .is_some_and(|threads| threads.contains(thread))
+        {
+            return Err(RegistryError::UnknownThread);
         }
         let mut operation = ActiveOperation {
             registry: self,
@@ -605,6 +661,12 @@ mod tests {
                     ),
                 ),
                 (
+                    "thread/resume",
+                    Some(
+                        json!({"thread":{"id":"t"},"sandbox":{"type":"readOnly"},"approvalPolicy":"on-request","approvalsReviewer":"user"}),
+                    ),
+                ),
+                (
                     "account/rateLimits/read",
                     Some(json!({"rateLimits":{"primary":{"usedPercent":43}}})),
                 ),
@@ -633,6 +695,11 @@ mod tests {
             .await
             .unwrap();
         registry.start_thread(profile, "a").await.unwrap();
+        assert_eq!(
+            registry.resume_thread(profile, "other").await,
+            Err(RegistryError::UnknownThread)
+        );
+        assert_eq!(registry.resume_thread(profile, "t").await.unwrap(), "t");
         assert_eq!(
             registry
                 .refresh_limits(profile)
@@ -675,6 +742,9 @@ mod tests {
         assert_eq!(task.await.unwrap(), Err(RegistryError::Revoked));
         assert!(received.recv().await.is_none());
         assert!(dropped.load(Ordering::SeqCst));
+        assert!(registry.threads.lock().unwrap().contains_key(&profile));
+        registry.forget_profile(profile).unwrap();
+        assert!(!registry.threads.lock().unwrap().contains_key(&profile));
         fake.await.unwrap();
     }
 }
