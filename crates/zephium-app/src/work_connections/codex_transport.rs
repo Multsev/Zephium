@@ -66,9 +66,37 @@ where
     if operation == Request::Initialized {
         return Err(TransportError::Protocol(ProtocolError::Unexpected));
     }
+    request_line(reader, writer, operation.encode(id), id).await
+}
+
+pub async fn models_next_page<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    id: u64,
+    cursor: &str,
+) -> Result<Vec<u8>, TransportError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let line =
+        super::codex_protocol::models_next_page(id, cursor).map_err(TransportError::Protocol)?;
+    request_line(reader, writer, line, id).await
+}
+
+async fn request_line<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    line: String,
+    id: u64,
+) -> Result<Vec<u8>, TransportError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         writer
-            .write_all(operation.encode(id).as_bytes())
+            .write_all(line.as_bytes())
             .await
             .map_err(|_| TransportError::Io)?;
         writer.flush().await.map_err(|_| TransportError::Io)?;

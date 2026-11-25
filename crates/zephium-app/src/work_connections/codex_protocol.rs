@@ -111,6 +111,10 @@ fn response(line: &[u8], id: u64) -> Result<Value, ProtocolError> {
         .ok_or(ProtocolError::Malformed)
 }
 
+pub fn initialize_response(line: &[u8], id: u64) -> Result<(), ProtocolError> {
+    response(line, id).map(|_| ())
+}
+
 fn text(value: &Value) -> Option<String> {
     let s = value.as_str()?;
     (!s.is_empty() && s.len() <= MAX_TEXT_BYTES && !s.chars().any(char::is_control))
