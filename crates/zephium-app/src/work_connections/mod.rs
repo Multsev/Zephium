@@ -4,6 +4,7 @@
 //! writes as the person stops for a Confirm with a preview. What a service
 //! returns is data for the agent, never instructions.
 pub mod cli;
+pub mod codex_protocol;
 pub mod gh;
 mod github_broker;
 pub mod helper;
