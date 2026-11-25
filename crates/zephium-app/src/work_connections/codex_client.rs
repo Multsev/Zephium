@@ -171,6 +171,55 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    /// Runs only on an ephemeral CI runner with a blank Codex home.
+    #[tokio::test]
+    #[ignore = "requires a dedicated ephemeral CI runner and installed test CLI"]
+    async fn native_codex_signed_out() {
+        use std::process::Stdio;
+        assert_eq!(std::env::var("CI").as_deref(), Ok("true"));
+        assert_eq!(std::env::var("ZEPHIUM_CODEX_CI_PROBE").as_deref(), Ok("1"));
+        let runner = std::env::var_os("RUNNER_TEMP").expect("isolated runner temp");
+        let temporary = tempfile::tempdir_in(&runner).expect("isolated temporary home");
+        let codex_home = temporary.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let launcher = std::path::PathBuf::from(&runner)
+            .join("zephium-codex-probe/node_modules/@openai/codex/bin/codex.js");
+        assert!(launcher.is_file());
+        let mut command = tokio::process::Command::new("node");
+        command.arg(launcher).arg("app-server").env_clear();
+        for name in ["PATH", "SystemRoot", "COMSPEC"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .env("HOME", temporary.path())
+            .env("USERPROFILE", temporary.path())
+            .env("CODEX_HOME", &codex_home)
+            .env("TMPDIR", temporary.path())
+            .env("TEMP", temporary.path())
+            .env("TMP", temporary.path())
+            .current_dir(temporary.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("start test CLI");
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Client::connect(BufReader::new(output), input),
+        )
+        .await
+        .expect("handshake deadline")
+        .expect("protocol handshake");
+        assert_eq!(result.snapshot().account, Account::SignedOut);
+        drop(result);
+        child.start_kill().ok();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    }
+
     #[tokio::test]
     async fn cancelled_request_cannot_reuse_an_ambiguous_connection() {
         let (client_stream, _server) = duplex(2048);

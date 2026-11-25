@@ -1,0 +1,39 @@
+name: Codex protocol probe
+
+on:
+  push:
+    branches: [feat/codex-integration]
+    paths:
+      - .github/workflows/codex-protocol-probe.yml
+      - crates/zephium-app/src/work_connections/codex_*.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-cli:
+    if: github.repository == 'Multsev/Zephium'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      ZEPHIUM_CODEX_CI_PROBE: '1'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Install pinned Codex CLI into runner temporary storage
+        shell: bash
+        run: npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/zephium-codex-probe" @openai/codex@0.147.0
+      - name: Install project Rust toolchain
+        run: rustup toolchain install --profile minimal
+      - name: Check real CLI handshake with a blank temporary account
+        run: cargo test -p zephium-app --locked --features work-runtime,work-execution native_codex_signed_out -- --ignored
