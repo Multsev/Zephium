@@ -39,13 +39,51 @@ pub struct Window {
     pub resets_at: Option<i64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Limit {
     pub id: Option<String>,
     pub name: Option<String>,
     pub plan: Option<String>,
     pub primary: Option<Window>,
     pub secondary: Option<Window>,
+    pub credits: Option<Credits>,
+    pub individual_limit: Option<SpendLimit>,
+    pub reached_type: Option<String>,
+    pub spend_control_reached: Option<bool>,
+}
+
+impl std::fmt::Debug for Limit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Limit(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credits {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    /// The server's text, with no inferred currency or unit.
+    pub balance: Option<String>,
+}
+
+impl std::fmt::Debug for Credits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Credits(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpendLimit {
+    pub limit: String,
+    pub used: String,
+    pub remaining_percent: i32,
+    pub resets_at: i64,
+}
+
+impl std::fmt::Debug for SpendLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpendLimit(<redacted>)")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,12 +218,66 @@ fn limit(value: &Value) -> Result<Limit, ProtocolError> {
     if !value.is_object() {
         return Err(ProtocolError::Malformed);
     }
+    let credits = match value.get("credits") {
+        None | Some(Value::Null) => None,
+        Some(item) => {
+            let balance = match item.get("balance") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(text(value).ok_or(ProtocolError::Malformed)?),
+            };
+            Some(Credits {
+                has_credits: item
+                    .get("hasCredits")
+                    .and_then(Value::as_bool)
+                    .ok_or(ProtocolError::Malformed)?,
+                unlimited: item
+                    .get("unlimited")
+                    .and_then(Value::as_bool)
+                    .ok_or(ProtocolError::Malformed)?,
+                balance,
+            })
+        }
+    };
+    let individual_limit = match value.get("individualLimit") {
+        None | Some(Value::Null) => None,
+        Some(item) => Some(SpendLimit {
+            limit: item
+                .get("limit")
+                .and_then(text)
+                .ok_or(ProtocolError::Malformed)?,
+            used: item
+                .get("used")
+                .and_then(text)
+                .ok_or(ProtocolError::Malformed)?,
+            remaining_percent: item
+                .get("remainingPercent")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or(ProtocolError::Malformed)?,
+            resets_at: item
+                .get("resetsAt")
+                .and_then(Value::as_i64)
+                .ok_or(ProtocolError::Malformed)?,
+        }),
+    };
+    let spend_control_reached = match value.get("spendControlReached") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_bool().ok_or(ProtocolError::Malformed)?),
+    };
+    let reached_type = match value.get("rateLimitReachedType") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(text(value).ok_or(ProtocolError::Malformed)?),
+    };
     Ok(Limit {
         id: value.get("limitId").and_then(text),
         name: value.get("limitName").and_then(text),
         plan: value.get("planType").and_then(text),
         primary: window(value.get("primary"))?,
         secondary: window(value.get("secondary"))?,
+        credits,
+        individual_limit,
+        reached_type,
+        spend_control_reached,
     })
 }
 
@@ -323,6 +415,28 @@ mod tests {
             ),
             Err(ProtocolError::Malformed)
         );
+    }
+
+    #[test]
+    fn credits_and_individual_limits_keep_server_values_without_guessing_units() {
+        let line = br#"{"id":2,"result":{"rateLimits":{"credits":{"hasCredits":true,"unlimited":false,"balance":"12.50"},"individualLimit":{"limit":"30","used":"17.5","remainingPercent":42,"resetsAt":1800000000},"rateLimitReachedType":"workspace_member_usage_limit_reached","spendControlReached":true}}}"#;
+        let limits = limits_response(line, 2).unwrap();
+        let first = &limits[0];
+        assert_eq!(
+            first.credits.as_ref().unwrap().balance.as_deref(),
+            Some("12.50")
+        );
+        assert_eq!(
+            first.individual_limit.as_ref().unwrap().remaining_percent,
+            42
+        );
+        assert_eq!(first.spend_control_reached, Some(true));
+        assert_eq!(
+            first.reached_type.as_deref(),
+            Some("workspace_member_usage_limit_reached")
+        );
+        assert!(!format!("{first:?}").contains("12.50"));
+        assert_eq!(limits_response(br#"{"id":2,"result":{"rateLimits":{"credits":{"hasCredits":"yes","unlimited":false}}}}"#, 2), Err(ProtocolError::Malformed));
     }
     #[test]
     fn model_pages_hide_internal_models_and_validate_metadata() {
